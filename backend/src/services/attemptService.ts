@@ -102,8 +102,22 @@ export async function submitAttempt(input: SubmitAttemptInput): Promise<SubmitAt
 
     await client.query('COMMIT');
     return { outcome: 'created', attemptId, readiness };
-  } catch (err) {
+  } catch (err: any) {
     await client.query('ROLLBACK');
+    // Race: another concurrent request won and inserted the idempotency
+    // record first (SELECT ... FOR UPDATE can't lock a row that doesn't
+    // exist yet). Re-fetch its stored outcome and replay it instead of
+    // surfacing this as a hard failure.
+    if (err.code === '23505') {
+      const { rows } = await pool.query(
+        `SELECT response_status, response_body FROM idempotency_records
+         WHERE tenant_id = $1 AND idempotency_key = $2`,
+        [input.tenantId, input.idempotencyKey]
+      );
+      if (rows[0]) {
+        return { outcome: 'replayed', status: rows[0].response_status, body: rows[0].response_body };
+      }
+    }
     throw err;
   } finally {
     client.release();
