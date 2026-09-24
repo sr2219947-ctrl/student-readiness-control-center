@@ -1,6 +1,6 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { seed, SEED_IDS } from '../../src/db/seed';
-import { getLatestAttemptsByCompetency } from '../../src/services/studentService';
+import { getLatestAttemptsByCompetency, updateStudent } from '../../src/services/studentService';
 import { calculateReadiness } from '../../src/domain/readiness';
 import { pool } from '../../src/config/db';
 
@@ -68,5 +68,69 @@ describe('getLatestAttemptsByCompetency (integration)', () => {
     expect(result.backend).toBeNull();
     expect(result.databases).toBeNull();
     expect(result.problem_solving).toBeNull();
+  });
+});
+
+describe('updateStudent (integration)', () => {
+  beforeEach(async () => {
+    await seed(); // reset to a known state (version 1) before each test in this block,
+    // since these tests mutate the row and can't share state the way the read-only tests above do.
+  });
+
+  it('updates successfully when the expected version matches, and bumps version', async () => {
+    const result = await updateStudent(
+      SEED_IDS.tenantA,
+      SEED_IDS.studentComplete,
+      1, // seed.ts creates students at version 1
+      { name: 'Updated Name' }
+    );
+
+    expect(result.outcome).toBe('updated');
+    if (result.outcome === 'updated') {
+      expect(result.newVersion).toBe(2);
+    }
+
+    const { rows } = await pool.query('SELECT name, version FROM students WHERE id = $1', [SEED_IDS.studentComplete]);
+    expect(rows[0].name).toBe('Updated Name');
+    expect(rows[0].version).toBe(2);
+  });
+
+  it('only updates the field provided, leaving the other untouched (COALESCE behavior)', async () => {
+    await updateStudent(SEED_IDS.tenantA, SEED_IDS.studentComplete, 1, { email: 'new@a.test' });
+
+    const { rows } = await pool.query('SELECT name, email FROM students WHERE id = $1', [SEED_IDS.studentComplete]);
+    expect(rows[0].email).toBe('new@a.test');
+    expect(rows[0].name).toBe('Complete Student'); // unchanged from seed
+  });
+
+  it('rejects a stale version with version_conflict and reports the current version', async () => {
+    // First update succeeds, bumping version 1 -> 2
+    await updateStudent(SEED_IDS.tenantA, SEED_IDS.studentComplete, 1, { name: 'First Update' });
+
+    // Second update still claims version 1 — stale, since the row is now at version 2
+    const result = await updateStudent(SEED_IDS.tenantA, SEED_IDS.studentComplete, 1, { name: 'Stale Update' });
+
+    expect(result.outcome).toBe('version_conflict');
+    if (result.outcome === 'version_conflict') {
+      expect(result.currentVersion).toBe(2);
+    }
+
+    // Confirm the stale update did NOT partially apply
+    const { rows } = await pool.query('SELECT name FROM students WHERE id = $1', [SEED_IDS.studentComplete]);
+    expect(rows[0].name).toBe('First Update'); // not 'Stale Update'
+  });
+
+  it('returns not_found for a student in a different tenant (no existence leak)', async () => {
+    // studentComplete belongs to tenantA; ask with tenantB's id
+    const result = await updateStudent(SEED_IDS.tenantB, SEED_IDS.studentComplete, 1, { name: 'Should Not Apply' });
+
+    expect(result.outcome).toBe('not_found');
+  });
+
+  it('returns not_found for a genuinely nonexistent student id', async () => {
+    const fakeId = '99999999-9999-9999-9999-999999999999';
+    const result = await updateStudent(SEED_IDS.tenantA, fakeId, 1, { name: 'Nobody' });
+
+    expect(result.outcome).toBe('not_found');
   });
 });

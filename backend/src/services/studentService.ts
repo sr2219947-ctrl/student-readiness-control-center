@@ -42,3 +42,51 @@ export async function getLatestAttemptsByCompetency(
 
   return result;
 }
+
+export type UpdateStudentResult =
+  | { outcome: 'updated'; newVersion: number }
+  | { outcome: 'version_conflict'; currentVersion: number }
+  | { outcome: 'not_found' };
+
+interface UpdateStudentInput {
+  name?: string;
+  email?: string;
+}
+
+// Only 'name' and 'email' are updatable — hardcoded, not derived from the
+// request body, so there is no way for a client to smuggle in an update to
+// tenant_id, current_score, or version itself (mass-assignment protection).
+export async function updateStudent(
+  tenantId: string,
+  studentId: string,
+  expectedVersion: number,
+  fields: UpdateStudentInput
+): Promise<UpdateStudentResult> {
+  if (fields.name === undefined && fields.email === undefined) {
+    throw new Error('At least one of name or email must be provided');
+  }
+
+  const result = await pool.query(
+    `UPDATE students
+     SET name = COALESCE($1, name),
+         email = COALESCE($2, email),
+         version = version + 1
+     WHERE tenant_id = $3 AND id = $4 AND version = $5
+     RETURNING version`,
+    [fields.name ?? null, fields.email ?? null, tenantId, studentId, expectedVersion]
+  );
+
+  if (result.rows.length > 0) {
+    return { outcome: 'updated', newVersion: result.rows[0].version };
+  }
+
+  const check = await pool.query(
+    `SELECT version FROM students WHERE tenant_id = $1 AND id = $2`,
+    [tenantId, studentId]
+  );
+
+  if (check.rows.length === 0) {
+    return { outcome: 'not_found' };
+  }
+  return { outcome: 'version_conflict', currentVersion: check.rows[0].version };
+}
